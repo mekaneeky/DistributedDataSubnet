@@ -33,7 +33,7 @@ import template
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausFalLM, AutoTokenizer, AdamW, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 def get_config():
@@ -174,7 +174,7 @@ def main( config ):
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=synapse.steps)  
 
         # Load dataset
-        dataset = load_dataset(synapse.dataset_name, 'wikitext-2-v1', split='train')
+        dataset = load_dataset(synapse.dataset_name, 'wikitext-2-v1', split='train')#streaming=True? or some lazy loading TODO shard dataset on HF
         dataset = dataset.select(range(synapse.dataset_indices[0], synapse.dataset_indices[1]))
 
         # Define encoding function
@@ -185,7 +185,7 @@ def main( config ):
         encoded_dataset = dataset.map(encode, batched=True)
         
         # Create a PyTorch DataLoader
-        dataloader = DataLoader(encoded_dataset, batch_size=synapse.batch_size)
+        dataloader = DataLoader(encoded_dataset, batch_size=synapse.batch_size)#TODO determined by device capacity
 
         # Train data for one epoch
         for step, batch in enumerate(dataloader):
@@ -213,6 +213,7 @@ def main( config ):
             # synpase.loss = loss
             loss.backward()
 
+            #FIXME does this cause a memory leak?
             if step == 0:
                 synapse.gradients = []
                 # Store gradients

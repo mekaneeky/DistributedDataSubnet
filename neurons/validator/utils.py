@@ -61,6 +61,17 @@ def get_random_uids(metagraph, k: int, exclude: List[int] = None) -> torch.LongT
     
     return uids
 
+def get_validator_ip_strs(metagraph):
+    #TODO write test
+    #FIXME Would this crash if there are inactive/fake validators?
+    validators = []
+    for axon, v_status, vtrust in zip(metagraph.axons, metagraph.validator_permit, metagraph.validator_trust):
+        if v_status and vtrust > 0.0:
+            validators.append(axon.ip_str.replace(":","/tcp/"))
+    return validators
+
+
+
 class AsyncDendritePool:
     def __init__(self, wallet, metagraph):
         self.metagraph = metagraph

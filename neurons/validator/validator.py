@@ -45,6 +45,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, get_linear_
 from optimum.bettertransformer import BetterTransformer
 from utils import get_random_uids, AsyncDendritePool
 
+from hivemind import DHT
+
 # Step 2: Set up the configuration parser
 # This function is responsible for setting up and parsing command-line arguments.
 def get_config():
@@ -102,12 +104,34 @@ async def main( config ):
 
     # The metagraph holds the state of the network, letting us know about other miners.
     metagraph = subtensor.metagraph( config.netuid )
+    potential_dht_peers = get_validator_ip_strs(metagraph)
+
+    if len(potential_dht_peers) > 0:
+        try:
+            #connect to existing dht
+            #TODO dht_common_state should have an enclosing class that handles reading and writing with the hotkey.
+            dht_common_state = DHT(
+                initial_peers = potential_dht_peers,
+                start=True
+            )
+        except Exception as exc:
+            #log error
+            bt.logging.error(f"DHT Creation failed: {exc}")
+            #Potentially do a loop over initial_peers
+            exit()
+            #launch dht?
+    else:
+        #launch first dht
+        dht_common_state = DHT(start=True)
+
+
     bt.logging.info(f"Metagraph: {metagraph}")
 
     # Dendrite is the RPC client; it lets us send messages to other nodes (axons) in the network.
     dendrite = bt.dendrite( wallet = wallet )
     dendrite_pool = AsyncDendritePool( wallet = wallet, metagraph = metagraph )
     bt.logging.info(f"Dendrite: {dendrite}")
+
 
     # Step 5: Connect the validator to the network
     if wallet.hotkey.ss58_address not in metagraph.hotkeys:
@@ -127,7 +151,10 @@ async def main( config ):
     # Step 7: Init dataset
     config.dataset_name = "wikitext"
     config.batch_size = 16
-    config.num_of_duplicates = 2 # number of miners running the same process for validation
+    config.num_of_duplicates = 2 # number of miners running the same process for validation 
+                                 # TODO don't do for all. slow. 
+                                 # TODO add some system to keep track of succesful runs
+                                 # TODO sync with other validators. Shared state.
     dataset = load_dataset(config.dataset_name, 'wikitext-2-v1', split='train')
 
     # Step 8: The Main Validation Loop
@@ -135,8 +162,7 @@ async def main( config ):
     step = 0
     while True:
         try:
-            
-            uids = get_random_uids(metagraph, k=100) # .to(self.device)
+            uids = get_random_uids(metagraph, k=100) # .to(self.device) 
             num_data_splits = math.floor(len(uids) / config.num_of_duplicates)
             split_uids = [uids[(i*num_data_splits):(i*num_data_splits) + (num_data_splits+1)] for i in range(0, num_data_splits)]  
             
@@ -149,6 +175,8 @@ async def main( config ):
 
             # TODO split queries
             queries = []
+
+            # TODO add query check state
             for i in range(0, len(split_uids)):
                 queries.append(
                     template.train.Train( 
@@ -176,96 +204,17 @@ async def main( config ):
                 # Initialize the score for the current miner's response.
                 score = 0
             
-                # # Use CUDA if available, otherwise use CPU
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-                # Load pre-trained model and tokenizer
-                # model_name = 'sshleifer/tiny-gpt2'
-                # resp_i = ([], "kmfoda/tiny-random-gpt2", 'wikitext', 4, None)
-                model = AutoModelForCausalLM.from_pretrained(resp_i.model_name)
-
-                # load model weights
-                for layer, weight in zip(model.parameters(), resp_i.model_weights):
-                    # layer = torch.nn.parameter.Parameter(weight)
-                    layer = torch.nn.parameter.Parameter(bt.Tensor.deserialize(weight).clone().detach())
-
-                tokenizer = AutoTokenizer.from_pretrained(resp_i.model_name)
-                
-                # Add the EOS token as PAD token to ensure our dataloader doesn't throw an error for sequences of unequal length
-                tokenizer.pad_token = tokenizer.eos_token
-
-                # Move the model to the appropriate device
-                model.to(device)
-
-                # Load optimized and scheduler
-                if resp_i.optimizer_name == "adam":
-                    optimizer = torch.optim.AdamW(model.parameters(), lr = resp_i.lr)
-                else:
-                    optimizer = torch.optim.AdamW(model.parameters(), lr = resp_i.lr)
-                scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=resp_i.steps)  
-
-                # Define encoding function
-                def encode(examples):
-                    return tokenizer(examples['text'], truncation=True, max_length=512, padding='max_length', return_tensors='pt')
-
-                # Select the correct datapoints
-                dataset_sample = dataset.select(range(start_index, end_index))
-
-                # Encode the dataset
-                encoded_dataset = dataset_sample.map(encode, batched=True)
-
-                # Create a PyTorch DataLoader
-                dataloader = DataLoader(encoded_dataset, batch_size=resp_i.batch_size)
+               
 
                 if resp_i.gradients == []:
                     scores[i] = 0
                     continue
                 else:
-                    for layer, new_grads in zip(model.named_parameters(),resp_i.gradients):
+                    for layer, new_grads in zip(model.named_parameters(),resp_i.gradients):#FIXME remove weight sharing if sending grads
                         # layer[1].grad = torch.tensor(bt.Tensor.deserialize(new_grads))
                         layer[1].grad = bt.Tensor.deserialize(new_grads).clone().detach()
                     
-                    # Adjust gradient
-                    optimizer.step()
-                    scheduler.step() 
-                    optimizer.zero_grad()
-
-                    # Train data for one epoch
-                    for step, batch in enumerate(dataloader):
-                        
-                        # Move batch to device
-                        input_ids = torch.stack(batch['input_ids']).to(device)
-                        attention_mask = torch.stack(batch['attention_mask']).to(device)
-                        labels = torch.stack(batch["input_ids"]).to(device)
-
-                        # Forward pass
-                        outputs = model(
-                            input_ids = input_ids, 
-                            attention_mask = attention_mask,
-                            labels = labels
-                        )     
-                        
-                        # Backward pass
-                        loss = outputs.loss
-                        print(step)
-                        print(loss)
-                        # synpase.loss = loss
-                        loss.backward()
-
-                        # Adjust gradient
-                        optimizer.step()
-                        scheduler.step() 
-                        optimizer.zero_grad()
-
-                        if step == 10:
-                            break
-
-                    outputs = model(
-                        input_ids = torch.stack(batch["input_ids"]).to(device), 
-                        attention_mask = torch.stack(batch["attention_mask"]).to(device),
-                        labels = torch.stack(batch["input_ids"]).to(device)
-                    )  
-
+                    
                     print("final loss")
                     loss = float(outputs.loss)
                     rmse = math.sqrt(np.square(np.subtract([loss],[resp_i.loss])).mean())
