@@ -41,9 +41,13 @@ import os
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, get_linear_schedule_with_warmup
-from optimum.bettertransformer import BetterTransformer
-from utils import get_random_uids, AsyncDendritePool
+from transformers import (
+    AdamW,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
+from utils import AsyncDendritePool, get_random_uids
 
 from hivemind import DHT
 
@@ -132,7 +136,6 @@ async def main( config ):
     dendrite_pool = AsyncDendritePool( wallet = wallet, metagraph = metagraph )
     bt.logging.info(f"Dendrite: {dendrite}")
 
-
     # Step 5: Connect the validator to the network
     if wallet.hotkey.ss58_address not in metagraph.hotkeys:
         bt.logging.error(f"\nYour validator: {wallet} if not registered to chain connection: {subtensor} \nRun btcli register and try again.")
@@ -156,13 +159,15 @@ async def main( config ):
                                  # TODO add some system to keep track of succesful runs
                                  # TODO sync with other validators. Shared state.
     dataset = load_dataset(config.dataset_name, 'wikitext-2-v1', split='train')
+    dataset_indices = [i for i in range(0, len(dataset))]
 
     # Step 8: The Main Validation Loop
     bt.logging.info("Starting validator loop.")
     step = 0
     while True:
         try:
-            uids = get_random_uids(metagraph, k=100) # .to(self.device) 
+            
+            uids = get_random_uids(metagraph, k=100) # .to(self.device)
             num_data_splits = math.floor(len(uids) / config.num_of_duplicates)
             split_uids = [uids[(i*num_data_splits):(i*num_data_splits) + (num_data_splits+1)] for i in range(0, num_data_splits)]  
             
@@ -175,14 +180,18 @@ async def main( config ):
 
             # TODO split queries
             queries = []
-
-            # TODO add query check state
             for i in range(0, len(split_uids)):
-                queries.append(
-                    template.train.Train( 
-                        dataset_indices=[start_index * (config.batch_size*i), (end_index*(config.batch_size*i)) + (config.batch_size*i)],  
-                        model_name = "kmfoda/tiny-random-gpt2", 
-                        batch_size = config.batch_size
+                current_choice = random.choices(dataset_indices, k=config.batch_size)
+                dataset_indices = list(set(dataset_indices).difference(set(current_choice)))
+                print(f"length of new_dataset_indices {len(dataset_indices)}")
+                
+                for j in split_uids[i]:
+                    queries.append(
+                        template.train.Train( 
+                            dataset_indices=dataset_indices,
+                            model_name = "kmfoda/tiny-random-gpt2", 
+                            batch_size = config.batch_size
+                        )
                     )
                 )
 
@@ -198,23 +207,102 @@ async def main( config ):
             # Log the results for monitoring purposes.
             bt.logging.info(f"Received responses: {responses}")
 
-            # TODO(developer): Define how the validator scores responses.
-            # Adjust the scores based on responses from miners.
-            for i, resp_i in enumerate(responses):
-                # Initialize the score for the current miner's response.
-                score = 0
-            
-               
+            if step % 1 == 0:
+                for i in range(0, split_uids):
+                    swarm_responses = responses[(i*config.num_of_duplicates):(i*config.num_of_duplicates)+(config.num_of_duplicates+1)]
 
-                if resp_i.gradients == []:
-                    scores[i] = 0
-                    continue
-                else:
-                    for layer, new_grads in zip(model.named_parameters(),resp_i.gradients):#FIXME remove weight sharing if sending grads
-                        # layer[1].grad = torch.tensor(bt.Tensor.deserialize(new_grads))
-                        layer[1].grad = bt.Tensor.deserialize(new_grads).clone().detach()
+                    swarm_losses = [swarm_response.loss for swarm_response in swarm_responses]
+                    filtered_swarm_losses = [loss for loss in swarm_losses if loss != np.nan]
+
+                    if (swarm_losses.count(swarm_losses[0]) == len(swarm_losses)) and (len(filtered_swarm_losses) > 1):
+                        score = 1.0
+                        scores[split_uids[i]] = (alpha * scores[split_uids[i]]) + ((1 - alpha) * score)
+                        # Log the results for monitoring purposes.
+                        bt.logging.info(f"Score: {score}")
+                    else:
+                        # # Adjust the scores based on responses from miners.
+                        # for i, response in enumerate(responses):
+                        response = swarm_responses[0]
+
+                        # Initialize the score for the current miner's response.
+                        score = 0
                     
-                    
+                        # # Use CUDA if available, otherwise use CPU
+                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+                        # Load pre-trained model and tokenizer
+                        # model_name = 'sshleifer/tiny-gpt2'
+                        # response = ([], "kmfoda/tiny-random-gpt2", 'wikitext', 4, None)
+                        model = AutoModelForCausalLM.from_pretrained(response.model_name)
+
+                        # load model weights
+                        for layer, weight in zip(model.parameters(), response.model_weights):
+                            # layer = torch.nn.parameter.Parameter(weight)
+                            layer = torch.nn.parameter.Parameter(bt.Tensor.deserialize(weight).clone().detach())
+
+                        tokenizer = AutoTokenizer.from_pretrained(response.model_name)
+                        
+                        # Add the EOS token as PAD token to ensure our dataloader doesn't throw an error for sequences of unequal length
+                        tokenizer.pad_token = tokenizer.eos_token
+
+                        # Move the model to the appropriate device
+                        model.to(device)
+
+                        # Load optimized and scheduler
+                        if response.optimizer_name == "adam":
+                            optimizer = torch.optim.AdamW(model.parameters(), lr = response.lr)
+                        else:
+                            optimizer = torch.optim.AdamW(model.parameters(), lr = response.lr)
+                        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=response.steps)  
+
+                        # Define encoding function
+                        def encode(examples):
+                            return tokenizer(examples['text'], truncation=True, max_length=512, padding='max_length', return_tensors='pt')
+
+                        # Select the correct datapoints
+                        dataset_sample = dataset.select(response.dataset_indices)
+
+                        # Encode the dataset
+                        encoded_dataset = dataset_sample.map(encode, batched=True)
+
+                        # Create a PyTorch DataLoader
+                        dataloader = DataLoader(encoded_dataset, batch_size=response.batch_size)
+
+                        # if response.gradients == []:
+                        #     scores[i] = 0
+                        #     continue
+                        # else:
+                        #     for layer, new_grads in zip(model.named_parameters(),response.gradients):
+                        #         # layer[1].grad = torch.tensor(bt.Tensor.deserialize(new_grads))
+                        #         layer[1].grad = bt.Tensor.deserialize(new_grads).clone().detach()
+                            
+                        #     # Adjust gradient
+                        #     optimizer.step()
+                        #     scheduler.step() 
+                        #     optimizer.zero_grad()
+
+                        # Train data for one epoch
+                        for step, batch in enumerate(dataloader):
+                            
+                            # Move batch to device
+                            input_ids = torch.stack(batch['input_ids']).to(device)
+                            attention_mask = torch.stack(batch['attention_mask']).to(device)
+                            labels = torch.stack(batch["input_ids"]).to(device)
+
+                            # Forward pass
+                            outputs = model(
+                                input_ids = input_ids, 
+                                attention_mask = attention_mask,
+                                labels = labels
+                            )     
+                            
+                            # Backward pass
+                            loss = outputs.loss
+                            print(step)
+                            print(loss)
+                            # synpase.loss = loss
+                            loss.backward()
+
                     print("final loss")
                     loss = float(outputs.loss)
                     rmse = math.sqrt(np.square(np.subtract([loss],[resp_i.loss])).mean())
@@ -229,8 +317,23 @@ async def main( config ):
                     # A higher weight means that the miner has been consistently responding correctly.
                     scores[i] = alpha * scores[i] + (1 - alpha) * score
 
-                # Log the results for monitoring purposes.
-                bt.logging.info(f"Score: {score}")
+                        print("final loss")
+                        correct_loss = float(outputs.loss)
+
+                        for swarm_response in swarm_responses:
+                            rmse = math.sqrt(np.square(np.subtract([correct_loss],[response.loss])).mean())
+                            # Check if the miner has provided the correct response by doubling the dummy input.
+                            # If correct, set their score for this round to 1.
+                            if rmse < 0.01:
+                                score = 1
+
+                            # Update the global score of the miner.
+                            # This score contributes to the miner's weight in the network.
+                            # A higher weight means that the miner has been consistently responding correctly.
+                            scores[i] = alpha * scores[i] + (1 - alpha) * score
+
+                            # Log the results for monitoring purposes.
+                            bt.logging.info(f"Score: {score}")
 
             # Periodically update the weights on the Bittensor blockchain.
             # NOTE Disbaled for now due to weight settting bug
