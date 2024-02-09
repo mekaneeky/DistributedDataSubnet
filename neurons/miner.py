@@ -107,7 +107,8 @@ class Miner(BaseMinerNeuron):
                 retries += 1
                 bt.logging.error(f"Retrying...")
         utils.log_visible_maddrs(self.dht.get_visible_maddrs(), only_p2p=True)
-        self.model = AutoModelForCausalLM.from_pretrained(self.config.neuron.model_name)
+        # Test model is kmfoda/tiny-random-gpt2
+        self.model = AutoModelForCausalLM.from_pretrained("kmfoda/tiny-random-gpt2")
 
         # Add DHT address to wandb config
         self.config.neuron.initial_peers = self.config.neuron.initial_peers + [
@@ -116,7 +117,8 @@ class Miner(BaseMinerNeuron):
         ]
 
         # Move the model to the appropriate device
-        self.model = self.model.to(self.device)
+        # Test device is CPU
+        self.model = self.model.to("cpu")
 
         # Set up a decentralized optimizer that will average with peers in background
         opt = torch.optim.AdamW(self.model.parameters(), lr=self.config.neuron.lr)
@@ -124,7 +126,7 @@ class Miner(BaseMinerNeuron):
             dht=self.dht,  # use a DHT that is connected with other peers
             run_id=self.config.neuron.run_id,  # unique identifier of this collaborative run
             scheduler=None,
-            batch_size_per_step=self.config.neuron.local_batch_size_train*self.config.neuron.local_gradient_accumilation_steps_train,  # each call to opt.step adds this many samples towards the next epoch
+            batch_size_per_step=1,#self.config.neuron.local_batch_size_train*self.config.neuron.local_gradient_accumilation_steps_train,  # each call to opt.step adds this many samples towards the next epoch
             target_batch_size=self.config.neuron.global_batch_size_train,  # after peers collectively process this many samples, average weights and begin the next epoch
             optimizer=opt,  # wrap the SGD optimizer defined above
             use_local_updates=True,  # perform optimizer steps with local gradients, average parameters in background

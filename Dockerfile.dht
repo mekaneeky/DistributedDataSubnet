@@ -1,0 +1,13 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+RUN pip install -e . && python post_install.py
+
+ENV WALLET_NAME=miner_test HOTKEY_NAME=default RUN_ID=final_test \
+    INITIAL_PEERS=/ip4/127.0.0.1/tcp/10263/p2p/12D3KooWMfiDM67PW6GerfahQPPdc4Bt3tkiHo8vZXieZL5mVTsc BATCH_SIZE_TEST=1 \
+    ANNOUNCE_IP=216.249.100.66 AXON_PORT=21148 DHT_PORT=21149
+    
+ENTRYPOINT ["/app/run_miner.sh"]
+
