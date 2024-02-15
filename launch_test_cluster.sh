@@ -18,6 +18,11 @@ base_host_dht_port=9000
 base_container_axon_port=8000
 base_container_dht_port=9000
 
+docker run -d --name "container_validator_$i" --network $network_name --ip 172.18.0.$i \
+               -p $host_axon_port:$container_axon_port -p $host_dht_port:$container_dht_port \
+               -e WALLET_NAME=miner_test -e HOTKEY_NAME=miner_hotkey \
+               -e AXON_PORT=host_axon_port -e DHT_PORT=host_dht_port \
+               validator_image
 
 for ((i=1; i<=n; i++))
 do
